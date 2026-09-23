@@ -11,4 +11,4 @@ venv/
 .databricks/
 
 # OS
-.DS_Store
+.DS_Storedata/

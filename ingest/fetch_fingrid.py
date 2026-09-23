@@ -42,7 +42,7 @@ def fetch_dataset(dataset_id: int, start_time: str, end_time: str, api_key: str)
         all_rows.extend(payload["data"])
         time.sleep(RATE_LIMIT_SECONDS)  # always wait, even if this was the last page
 
-        next_page = payload["pagination"]["nextPage"]
+        next_page = payload["pagination"].get("nextPage")
         if next_page is None:
             break
 
