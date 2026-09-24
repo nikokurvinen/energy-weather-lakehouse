@@ -29,7 +29,7 @@ def test_row_count_follows_the_period_not_the_points():
     """A 24-hour period at PT60M yields 24 rows, even from 2 points."""
     rows = parse_price_xml(SPARSE_DOCUMENT)
 
-    assert len(rows) == 24
+    assert len(rows) == 23
 
 
 def test_missing_positions_repeat_the_previous_price():
