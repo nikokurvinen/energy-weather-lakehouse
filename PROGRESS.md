@@ -238,15 +238,224 @@ two sources genuinely differ.
 
 ---
 
-## Open items going into Day 3
+## Day 3 (Thu 2026-09-24)
 
-- Consolidate the two weather bronze tables into one canonical source. The direct API path is the
-  better default (no manual upload, schedulable as a job), with the local path documented as a
-  fallback if Open-Meteo ever stops resolving.
-- ENTSO-E price ingestion, blocked on API access approval (requested, ~3 business day SLA).
-- `ci.yml`, deleted placeholder, not yet built (planned Day 4: ruff + pytest on every PR).
-- Silver layer: harmonise the `time` type and column order, add a local-time column alongside
-  UTC (Finland is UTC+3 in summer, UTC+2 in winter), align the 15-minute Fingrid grain with the
-  hourly weather grain, handle the 23/24/25-hour DST days, and add SQL data-quality checks.
-- PR-based merge workflow, currently doing direct `git merge`; revisit once CI exists so PRs
-  have something to gate on.
+Bronze completed with the third source, then silver, quality checks, gold and a dimensional
+model in one long day.
+
+### ENTSO-E price ingestion
+
+API access was approved overnight, so the third source could finally be built. It differs from
+the other two in three ways, all of which had to be handled:
+
+- **The response is XML**, not JSON, so `xml.etree.ElementTree` replaces the JSON parser. Element
+  paths use the `{*}` namespace wildcard, because ENTSO-E changes its namespace URI between
+  document versions and matching it literally would break on the next schema revision.
+- **Rows carry no timestamp.** Each price point has a `position` number, and the time has to be
+  reconstructed from the period start plus the resolution. This is the real work in the parser.
+- **The token goes in a query parameter**, not a header, which turned out to matter later.
+
+*Bug 1 (sparse points):* the document declares `curveType A03`, "variable sized block", meaning a
+price holds until the next point changes it. Unchanged positions are simply omitted, so positions
+1, 2, 4 appear with 3 missing. Parsing the points as given would have produced gaps in the series
+and a wrong row count. Fixed with a forward fill: iterate every position from 1 to the number of
+intervals the period should contain, carrying the last seen price.
+
+*Bug 2 (overlapping chunks):* the request is chunked into 31-day windows to stay inside the API's
+per-request limit, but ENTSO-E returns whole market days, so each chunk returned 32 days and
+overlapped the next by one. 12 chunks means 11 boundaries, and 11 x 96 quarter-hours is exactly
+the 1,056 duplicate rows observed. Deduplicated by timestamp, keeping the first occurrence.
+
+*Trimming:* market days start at 22:00 UTC, so the result spilled outside the requested window by
+2 rows at the start (hourly resolution) and 88 at the end (22 hours at quarter-hourly), which is
+the 90 rows the trim removed. Final table: **34,134 rows**.
+
+**The dataset captures a market structure change.** Resolutions present are both `PT60M` and
+`PT15M`: the European day-ahead market moved from hourly to quarter-hourly settlement in early
+October 2025, inside the covered period. 334 hours at the old resolution, 8,450 at the new.
+
+**Daylight saving is visible, and the totals are still clean.** Per-chunk row counts showed one
+chunk four rows over and another four rows under, which is one hour more in October and one hour
+less in March. Yet the total reconciles exactly. The reason is that **UTC has no daylight saving**:
+every UTC day has 24 hours, and the clock changes only appear when the data is sliced by local
+market day. This is the concrete justification for the rule the whole project follows: store UTC,
+compute in UTC, convert to local time only for presentation.
+
+### The network map, completed
+
+All three source hosts were probed from the notebook with an identical request shape:
+
+| Host | Result |
+| --- | --- |
+| `archive-api.open-meteo.com` | reachable |
+| `data.fingrid.fi` | DNS resolution fails |
+| `web-api.tp.entsoe.eu` | DNS resolution fails |
+
+Yesterday's conclusion that "the allowlist is domain-specific" holds, and the picture is now
+complete rather than inferred from two data points.
+
+The two weather bronze tables were consolidated: the direct API table replaced the volume-based
+one and took its name, via `DROP` plus `ALTER TABLE ... RENAME TO`, run in the SQL editor rather
+than the notebook because a one-time migration inside a pipeline would break the next full run.
+
+### Silver layer
+
+Four tables, all conformed to one row per hour keyed on `time_utc`, with `time_local` derived
+alongside.
+
+- **Average, not sum.** Consumption and wind production are megawatts, a rate of power. The mean
+  of four quarter-hour readings is the hourly average power; summing would overstate it fourfold
+  and would only be correct if the unit were megawatt hours. This is a domain decision, not a
+  technical one, and it is the kind of thing that silently produces plausible wrong answers.
+- **Incomplete hours dropped.** The extraction window does not start or end on an exact hour, so
+  the edge hours held fewer than four readings and their averages were computed from a different
+  sample size than every other hour. Filtered on a reading count of exactly four.
+- **Type repair with a null check.** The weather `time` column arrives as text because it is built
+  from JSON. `to_timestamp` fails silently and returns null rather than raising, so an unchecked
+  cast can produce a table of 35,136 empty timestamps that only surfaces as an empty join much
+  later. The null count is asserted to be zero.
+- **Unit conversion.** Open-Meteo reports wind in km/h; converted to m/s, the Finnish convention
+  and the unit used when discussing turbine output.
+- **Weather deliberately keeps four rows per hour.** Averaging the observation points into a
+  national figure would destroy the regional signal that the project exists to measure.
+
+### Quality checks
+
+Defined as a view, `quality_check_results`, rather than as notebook cells, so the same definition
+can run from a job or from CI. A Python cell reads the view and raises if any check fails, which
+makes it a gate rather than a report: printed output nobody reads does not stop a bad load.
+
+Nine checks across three families: duplicate keys, gaps in the hourly series, and implausible
+values.
+
+**The gate fired on its first run, and the check was wrong rather than the data.** Fourteen rows in
+`silver_wind` failed the bound `wind_mw >= 0`. Investigation showed small negative values between
+-0.3 and -33 MW, clustered in calm periods. They are genuine: turbines draw power for control
+systems, heating and yaw motors when production is near zero, so measured output can be slightly
+negative, exactly as the day-ahead price can be. The bound was corrected to -500 MW rather than
+the data being clamped to zero, which would have looked tidier and falsified the energy balance.
+
+A quality rule written without domain knowledge produces false alarms. This one did, immediately,
+and the finding is kept rather than quietly edited away.
+
+**One documented exception.** The gap check excludes `2026-06-04 13:00` UTC by exact timestamp with
+the reason in a comment, because Fingrid is missing the 12:15 reading that day. A check that is
+permanently red trains the reader to ignore it; naming the known exception keeps everything else
+meaningful. Note that the excluded timestamp is the hour *after* the gap, because `LAG` flags the
+row that finds its predecessor too far back.
+
+### Gold, wide table
+
+`gold_hourly`, one row per hour with weather pivoted into per-location columns, national means,
+and the three measures. Inner joins trim the result to the window all four sources cover,
+`2025-09-23 15:00` to `2026-09-17 23:00`, without any hand-written date bounds.
+
+**8,624 rows, where the window implies 8,625.** The missing hour was traced end to end: `bronze_wind`
+held one reading fewer than `bronze_consumption`, which made one hour incomplete, which silver
+dropped, which the inner join then removed from all four sources. A `LAG` window function over
+`silver_wind` located it at `2026-06-04 12:00` UTC, and a direct query against bronze confirmed
+that hour holds three quarter-hours instead of four.
+
+The pipeline did the right thing without being asked: it dropped the hour rather than averaging
+three readings and presenting the result as equal to the other 8,623.
+
+### Dimensional model
+
+A star schema built alongside the wide table, because they serve different readers.
+
+**Two facts, because the grain differs.** `fact_power_hour` is one row per hour; `fact_weather_hour`
+is one row per hour per area. Merging them would repeat every national figure four times. When a
+question needs both, the finer fact is aggregated to the coarser grain first, in a CTE. Joining
+two facts of different grain directly is the classic error known as a fan trap.
+
+**Three dimensions.** `dim_date` keyed on a `yyyyMMdd` integer and derived from *local* time,
+because an analyst asking about Monday means the Finnish Monday. `dim_area` as SCD1, because
+nothing in it changes historically. `dim_wind_capacity` as SCD2, because installed capacity
+genuinely does.
+
+**The capacity figures are real, and nearly were not.** The plan called for a simulated capacity
+dimension. Before writing it that way, it was worth checking whether the data actually exists, and
+it does: ENTSO-E publishes installed generation capacity as documentType A68, annually per
+production type and bidding zone. Finland onshore wind: **8,224 MW in 2025 and 9,330 MW in 2026**.
+Fetched by `ingest/fetch_capacity.py`, which is in the repository so the figures can be re-derived
+rather than trusted.
+
+Per-area capacity is genuinely unavailable, but that turned out not to matter, because the original
+plan had it in the wrong place: capacity is a national quantity and belongs with the national fact.
+Attaching it there also makes the **capacity factor** computable, which is the metric that actually
+matters for wind and which normalises out the capacity growth inside the series.
+
+**Point-in-time join.** The fact joins the capacity dimension on a range rather than on equality,
+so each hour is matched to the version in force at that moment. Joining on `is_current` instead
+would have applied 2026 capacity to 2025 hours and understated every early capacity factor. SCD2
+without a point-in-time join does nothing useful; the two belong together.
+
+Validated on both failure modes: 8,624 rows means the range join multiplied nothing, and zero
+unmatched rows means the validity periods cover the series without gaps.
+
+### Findings
+
+**Temperature explains consumption.** 14,525 MW below -20 C against 8,515 MW between +10 and +20,
+roughly 70 percent more in the cold.
+
+**Two apparent effects turned out to be confounded, and both were tested rather than assumed.**
+Consumption appeared to rise again above +20 C; holding the hour of day constant at 13:00 removed
+the reversal, because those hours are summer afternoons compared against spring and autumn nights.
+Consumption also appeared to rise with wind among mild hours, which is not causal: "mild" covers
+everything above zero, and windy hours are autumn storms sitting at the cold end of that band.
+
+**Vaasa's wind speed explains national production best**, correlation 0.761 against capacity factor,
+followed by Oulu 0.726, Kuopio 0.634 and Helsinki 0.523. The ranking reconstructs the geography of
+Finnish wind capacity from the data alone: concentrated on the west coast from Vaasa northward.
+Nothing in the model was told where the turbines are. This validates the silver decision not to
+average the observation points.
+
+**Cold and calm together is the expensive case.** A cold calm hour averages 147.29 EUR/MWh, about
+14.7 cents per kWh; a mild windy hour averages 10.64, about 1.1 cents. Holding temperature at cold
+and varying only wind, the price falls 73 percent while consumption barely moves, which isolates
+the supply-side effect. Cold calm hours are 885, roughly 10 percent of the year, so this is a
+recurring condition rather than a rare extreme.
+
+**On averaging.** Summed per city there are 492 hours below -20 C; the national average produces
+47. Averaging four points discards roughly 90 percent of locally extreme cold, because one mild
+city cancels another's extreme.
+
+### A security incident, and what caused it
+
+**The ENTSO-E API token was exposed in a screenshot** shared while debugging a 400 error. ENTSO-E
+takes the token as a query parameter, so it appears in full inside every error message, log line
+and stack trace. The token was revoked and regenerated immediately.
+
+Impact was low: the token grants read access to public market data with no billing attached. The
+lesson is structural rather than about carelessness. An API that puts credentials in the URL leaks
+them into places that are easy to share by accident, which is exactly why Fingrid and most modern
+APIs use a header instead. When an API forces the token into the query string, screenshots and log
+output need handling with specific care.
+
+### Unused leftovers
+
+Both Databricks secret scopes, `fingrid` and `entsoe`, are now unused: neither source is reachable
+from Databricks, so no notebook authenticates against anything. An earlier note here argued they
+were worth keeping because they "document the attempt". That reasoning was weak. This file
+documents the attempt; a secret store holding a revoked credential documents nothing. Both should
+be deleted.
+
+---
+
+## Open items going into Day 4
+
+- **Incremental loading.** Every layer currently does a full refresh with `mode("overwrite")`,
+  which works at 35,000 rows but is not how this is done in practice. The intended design is a
+  watermark plus a Delta `MERGE`, with a trailing re-merge window for the two Fingrid series
+  because measured data is revised as settlement completes. The day-ahead price does not need one:
+  an auction clearing price is a binding contract and is final once published. Different treatment
+  per source, decided by whether that source revises.
+- **`ci.yml`**, still not built. Planned: ruff and pytest on every push.
+- **Dashboard**, not started.
+- **Scheduling.** A daily refresh cannot run entirely inside Databricks, because two of three
+  sources are unreachable from it. The design is a scheduled GitHub Actions workflow that fetches,
+  uploads the CSVs to the Unity Catalog volume with the Databricks CLI, and triggers a Databricks
+  job to run the layers. Orchestration across two environments, caused by a network constraint.
+- **Delete the two unused secret scopes.**
+- **PR-based merge workflow**, still doing direct `git merge`; revisit once CI exists so a pull
+  request has something to gate on.
