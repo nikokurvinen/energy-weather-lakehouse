@@ -36,7 +36,9 @@ def fetch_dataset(dataset_id: int, start_time: str, end_time: str, api_key: str)
         }
         url = BASE_URL.format(dataset_id=dataset_id)
         response = requests.get(url, headers=headers, params=params, timeout=30)
-        response.raise_for_status()  # crash loudly on 4xx/5xx instead of silently returning bad data
+
+        # Crash loudly on 4xx/5xx instead of silently returning bad data
+        response.raise_for_status()
 
         payload = response.json()
         all_rows.extend(payload["data"])

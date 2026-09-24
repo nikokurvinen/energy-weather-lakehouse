@@ -1,13 +1,11 @@
 """Fetch installed onshore wind capacity for Finland from ENTSO-E."""
 
 import os
-from datetime import datetime, timezone
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
-
-import xml.etree.ElementTree as ET
-from datetime import timedelta
 
 BASE_URL = "https://web-api.tp.entsoe.eu/api"
 FINLAND_DOMAIN = "10YFI-1--------U"

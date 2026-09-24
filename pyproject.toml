@@ -1,3 +1,6 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [project]
 name = "energy-weather-lakehouse"
 version = "0.1.0"
@@ -6,6 +9,10 @@ requires-python = ">=3.10"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Databricks notebooks are not plain Python: cells use %sql and %md magics,
+# and rely on runtime-injected globals (spark, dbutils, display). A Python
+# linter produces noise rather than signal on them.
+extend-exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]  # pyflakes errors, style errors, import sorting
