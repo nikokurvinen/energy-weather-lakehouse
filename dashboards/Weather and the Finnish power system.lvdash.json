@@ -1,0 +1,664 @@
+{
+  "datasets": [
+    {
+      "name": "01f0887c",
+      "displayName": "price_by_conditions",
+      "queryLines": [
+        "WITH national_weather AS (\n",
+        "  SELECT time_utc, AVG(temperature_c) AS temp_avg_c\n",
+        "  FROM workspace.energy_weather.fact_weather_hour\n",
+        "  GROUP BY time_utc\n",
+        ")\n",
+        "SELECT\n",
+        "  CASE\n",
+        "    WHEN w.temp_avg_c <  0 THEN 'Cold (below 0)'\n",
+        "    WHEN w.temp_avg_c < 15 THEN 'Mild (0 to 15)'\n",
+        "    ELSE                        'Warm (above 15)'\n",
+        "  END AS temperature,\n",
+        "  CASE\n",
+        "    WHEN p.capacity_factor < 0.15 THEN 'Calm'\n",
+        "    WHEN p.capacity_factor < 0.45 THEN 'Moderate'\n",
+        "    ELSE                               'Windy'\n",
+        "  END AS wind_conditions,\n",
+        "  ROUND(AVG(p.price_eur_mwh), 2)      AS avg_price_eur_mwh,\n",
+        "  ROUND(AVG(p.price_eur_mwh) / 10, 2) AS avg_price_snt_kwh,\n",
+        "  ROUND(AVG(p.consumption_mw))        AS avg_consumption_mw,\n",
+        "  COUNT(*)                            AS hours\n",
+        "FROM workspace.energy_weather.fact_power_hour p\n",
+        "JOIN national_weather w ON p.time_utc = w.time_utc\n",
+        "GROUP BY 1, 2"
+      ]
+    },
+    {
+      "name": "11fe7b0b",
+      "displayName": "consumption_by_temperature",
+      "queryLines": [
+        "WITH national_weather AS (\n",
+        "  SELECT time_utc, AVG(temperature_c) AS temp_avg_c\n",
+        "  FROM workspace.energy_weather.fact_weather_hour\n",
+        "  GROUP BY time_utc\n",
+        ")\n",
+        "SELECT\n",
+        "  CASE\n",
+        "    WHEN w.temp_avg_c < -20 THEN 'Below -20'\n",
+        "    WHEN w.temp_avg_c < -10 THEN '-20 to -10'\n",
+        "    WHEN w.temp_avg_c <   0 THEN '-10 to 0'\n",
+        "    WHEN w.temp_avg_c <  10 THEN '0 to +10'\n",
+        "    WHEN w.temp_avg_c <  20 THEN '+10 to +20'\n",
+        "    ELSE                         'Above +20'\n",
+        "  END                          AS temperature_band,\n",
+        "  ROUND(AVG(p.consumption_mw)) AS avg_consumption_mw,\n",
+        "  COUNT(*)                     AS hours\n",
+        "FROM workspace.energy_weather.fact_power_hour p\n",
+        "JOIN national_weather w ON p.time_utc = w.time_utc\n",
+        "GROUP BY 1"
+      ]
+    },
+    {
+      "name": "fea743c4",
+      "displayName": "wind_correlation_by_city",
+      "queryLines": [
+        "SELECT\n",
+        "  CONCAT(a.city, ' (', a.region, ')')                AS location,\n",
+        "  ROUND(CORR(w.wind_speed_ms, p.capacity_factor), 3) AS correlation\n",
+        "FROM workspace.energy_weather.fact_weather_hour w\n",
+        "JOIN workspace.energy_weather.fact_power_hour p ON w.time_utc = p.time_utc\n",
+        "JOIN workspace.energy_weather.dim_area a ON w.area_id = a.area_id\n",
+        "GROUP BY 1"
+      ]
+    },
+    {
+      "name": "ffe1ea28",
+      "displayName": "monthly_variation",
+      "queryLines": [
+        "SELECT\n",
+        "  DATE_TRUNC('MONTH', d.date) AS month,\n",
+        "  ROUND(AVG(p.price_eur_mwh) / 10, 2) AS avg_price_snt_kwh,\n",
+        "  ROUND(AVG(p.consumption_mw))        AS avg_consumption_mw,\n",
+        "  ROUND(AVG(p.capacity_factor), 3)    AS avg_capacity_factor,\n",
+        "  COUNT(*)                            AS hours\n",
+        "FROM workspace.energy_weather.fact_power_hour p\n",
+        "JOIN workspace.energy_weather.dim_date d\n",
+        "  ON p.date_key = d.date_key\n",
+        "GROUP BY 1\n",
+        "ORDER BY 1"
+      ]
+    },
+    {
+      "name": "9e393a3f",
+      "displayName": "headline_numbers",
+      "queryLines": [
+        "SELECT\n",
+        "  COUNT(*)                          AS total_hours,\n",
+        "  ROUND(MAX(price_eur_mwh) / 10, 1) AS max_price_snt_kwh,\n",
+        "  ROUND(AVG(capacity_factor), 3)    AS avg_capacity_factor,\n",
+        "  ROUND(AVG(consumption_mw))        AS avg_consumption_mw\n",
+        "FROM workspace.energy_weather.fact_power_hour"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "93dfd064",
+      "displayName": "Findings",
+      "layout": [
+        {
+          "widget": {
+            "name": "a-cold-calm-hour-costs-14-times-a-mild-windy-one",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "01f0887c",
+                  "fields": [
+                    {
+                      "name": "temperature",
+                      "expression": "`temperature`"
+                    },
+                    {
+                      "name": "wind_conditions",
+                      "expression": "`wind_conditions`"
+                    },
+                    {
+                      "name": "avg(avg_price_snt_kwh)",
+                      "expression": "AVG(`avg_price_snt_kwh`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "showDescription": true,
+                "title": {
+                  "value": "A cold calm hour costs 16 times a warm windy one",
+                  "fields": []
+                },
+                "description": {
+                  "value": "<span style=\"font-size: 10px;color: #919191;\">Wind conditions are the national capacity factor: calm is under 15 percent, windy is 45 percent or more, against an annual mean near 30 percent. The warm windy bar rests on 74 hours; every other bar has at least 390.</span>",
+                  "fields": []
+                }
+              },
+              "version": 3,
+              "mark": {
+                "layout": "group"
+              },
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "wind_conditions",
+                  "axis": {
+                    "title": "Wind conditions"
+                  },
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "avg(avg_price_snt_kwh)",
+                  "axis": {
+                    "title": "Price (snt / kWh)"
+                  },
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "temperature",
+                  "displayName": "Temperature",
+                  "scale": {
+                    "type": "categorical",
+                    "mappings": [
+                      {
+                        "value": "Mild (0 to 15)",
+                        "color": "#8A94A0"
+                      },
+                      {
+                        "value": "Warm (above 15)",
+                        "color": "#E8842A"
+                      }
+                    ]
+                  }
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "consumption-rises-70-percent-in-cold",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "11fe7b0b",
+                  "fields": [
+                    {
+                      "name": "temperature_band",
+                      "expression": "`temperature_band`"
+                    },
+                    {
+                      "name": "avg(avg_consumption_mw)",
+                      "expression": "AVG(`avg_consumption_mw`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "showDescription": true,
+                "title": {
+                  "value": "Consumption rises 70 percent in the cold",
+                  "fields": []
+                },
+                "description": {
+                  "value": "<span style=\"font-size: 10px;color: #919191;\">The small rise above +20 C is a time-of-day effect, not cooling demand:those hours are almost all summer afternoons. Holding the hour constantat 13:00 removes it.</span>",
+                  "fields": []
+                }
+              },
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "temperature_band",
+                  "axis": {
+                    "title": "Temperature (C)"
+                  },
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "custom-order",
+                      "orderedValues": [
+                        "Below -20",
+                        "-20 to -10",
+                        "-10 to 0",
+                        "0 to +10",
+                        "+10 to +20",
+                        "Above +20"
+                      ]
+                    }
+                  }
+                },
+                "y": {
+                  "fieldName": "avg(avg_consumption_mw)",
+                  "axis": {
+                    "title": "Consumption (MW)"
+                  },
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 3,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "west-coast-wind-explains-national-production-best",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "fea743c4",
+                  "fields": [
+                    {
+                      "name": "location",
+                      "expression": "`location`"
+                    },
+                    {
+                      "name": "avg(correlation)",
+                      "expression": "AVG(`correlation`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "showDescription": true,
+                "title": {
+                  "value": "West coast wind explains national production best",
+                  "fields": []
+                },
+                "description": {
+                  "value": "<span style=\"font-size: 10px;color: #919191;\">Correlation between local wind speed and the national capacity factor,8,624 hours. All four are positive because weather systems span the wholecountry; the ranking is the finding, not the level.</span>",
+                  "fields": []
+                }
+              },
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "location",
+                  "axis": {
+                    "title": "Observation point"
+                  },
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "avg(correlation)",
+                  "axis": {
+                    "title": "Correlation with capacity factor"
+                  },
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 9,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "price-peaks-midwinter-nine-times-july-low",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ffe1ea28",
+                  "fields": [
+                    {
+                      "name": "month",
+                      "expression": "`month`"
+                    },
+                    {
+                      "name": "avg(avg_price_snt_kwh)",
+                      "expression": "AVG(`avg_price_snt_kwh`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showDescription": true,
+                "showTitle": true,
+                "title": {
+                  "value": "Price peaks in midwinter, nine times the July low",
+                  "fields": []
+                },
+                "description": {
+                  "value": "<span style=\"font-size: 10px;color: #919191;\">February and March had similar demand (13,032 and 11,056 MW) but opposite</span><span style=\"font-size: 10px;color: #919191;\">wind (capacity factor 0.19 and 0.42). The price differed fivefold. July is</span><span style=\"font-size: 10px;color: #919191;\">cheapest despite the year's lowest wind, because demand is lowest too.</span>",
+                  "fields": []
+                }
+              },
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "month",
+                  "axis": {
+                    "title": "Month"
+                  },
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "avg(avg_price_snt_kwh)",
+                  "axis": {
+                    "title": "Price (snt / kWh)"
+                  },
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 9,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "hours-analysed-8624",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "9e393a3f",
+                  "fields": [
+                    {
+                      "name": "sum(total_hours)",
+                      "expression": "SUM(`total_hours`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "title": {
+                  "value": "Hours analysed",
+                  "fields": []
+                }
+              },
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(total_hours)",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "none",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "peak-price-61-4-snt-kwh",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "9e393a3f",
+                  "fields": [
+                    {
+                      "name": "avg(max_price_snt_kwh)",
+                      "expression": "AVG(`max_price_snt_kwh`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "title": {
+                  "value": "Peak price (snt / kWh)",
+                  "fields": []
+                }
+              },
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "avg(max_price_snt_kwh)"
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 0,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "mean-capacity-factor-0-27",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "9e393a3f",
+                  "fields": [
+                    {
+                      "name": "avg(avg_capacity_factor)",
+                      "expression": "AVG(`avg_capacity_factor`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "title": {
+                  "value": "Mean capacity factor",
+                  "fields": []
+                }
+              },
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "avg(avg_capacity_factor)"
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 0,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "mean-consumption-9900-mw",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "9e393a3f",
+                  "fields": [
+                    {
+                      "name": "avg(avg_consumption_mw)",
+                      "expression": "AVG(`avg_consumption_mw`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "frame": {
+                "showTitle": true,
+                "title": {
+                  "value": "Mean consumption",
+                  "fields": []
+                }
+              },
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "avg(avg_consumption_mw)",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "none",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 0
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 9,
+            "y": 0,
+            "width": 3,
+            "height": 3
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1"
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "canvasBackgroundColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "widgetBackgroundColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "widgetBorderColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "fontColor": {
+        "light": "#11171C",
+        "dark": "#E8ECF0"
+      },
+      "selectionColor": {
+        "light": "#2272B4",
+        "dark": "#8ACAFF"
+      },
+      "visualizationColors": [
+        "#077A9D",
+        "#FFAB00",
+        "#00A972",
+        "#FF3621",
+        "#8BCAE7",
+        "#AB4057",
+        "#99DDB4",
+        "#FCA4A1",
+        "#919191",
+        "#BF7080"
+      ],
+      "widgetHeaderAlignment": "LEFT"
+    },
+    "applyModeEnabled": false
+  }
+}
