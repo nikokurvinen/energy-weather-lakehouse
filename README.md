@@ -23,22 +23,29 @@ Three sub-questions, plus the one that needs all three sources at once:
 
 ## Findings
 
-**A cold calm hour costs fourteen times a mild windy one.**
+**A cold calm hour costs sixteen times a warm windy one.**
 
-| Temperature | Wind | Hours | Consumption | Mean price |
-| --- | --- | --- | --- | --- |
-| cold | calm | 885 | 12,204 MW | **147.29 EUR/MWh** |
-| cold | windy | 396 | 12,612 MW | 40.32 |
-| mild | calm | 2,215 | 8,831 MW | 66.72 |
-| mild | windy | 1,428 | 10,221 MW | **10.64 EUR/MWh** |
+Mean day-ahead price in cents per kWh, by temperature and wind:
 
-Holding temperature constant at cold and varying only wind, the price falls **73 percent** while
-consumption barely moves. Demand is unchanged and supply increases, which isolates the supply-side
-effect.
+| | Calm | Moderate | Windy |
+| --- | --- | --- | --- |
+| **Cold** (below 0 C) | **14.73** | 8.99 | 4.03 |
+| **Mild** (0 to 15 C) | 7.76 | 3.70 | 1.07 |
+| **Warm** (above 15 C) | 4.61 | 1.92 | **0.91** |
+
+Nine cells, monotonic in both directions, no exceptions. Both factors act and they compound.
+
+Holding temperature constant at cold and varying only wind, the price falls **73 percent**
+(14.73 to 4.03) while consumption barely moves (12,204 to 12,612 MW). Demand is unchanged and
+supply increases, which isolates the supply-side effect.
 
 Cold calm hours are **885, about 10 percent of the year**. This is a recurring condition rather
 than a rare extreme, which is why a power system is dimensioned for its tightest hours rather than
-its average ones.
+its average ones. The peak hour reached **61.4 cents per kWh**.
+
+**The first version of this analysis used two temperature bands and hid a real effect.** "Mild"
+covered everything above zero, mixing a 5 C autumn evening with a 25 C summer afternoon, whose
+prices differ almost twofold. Splitting warm out revealed the full gradient.
 
 **Temperature drives consumption, strongly and monotonically.** 14,525 MW below -20 C against
 8,515 MW between +10 and +20, roughly 70 percent more in the cold.
@@ -58,10 +65,31 @@ along the west coast from Vaasa northward, sparse inland and in the south. Nothi
 was told where the turbines are. This is why the pipeline deliberately does not average the four
 observation points into a national figure.
 
+**February and March are a natural experiment inside the data.** Two winter months with similar
+demand and opposite wind:
+
+| | Consumption | Capacity factor | Price |
+| --- | --- | --- | --- |
+| February 2026 | 13,032 MW | 0.19 | **13.72 c/kWh** |
+| March 2026 | 11,056 MW | 0.42 | **2.78 c/kWh** |
+
+Demand differs by 18 percent, wind by 118 percent, price by 393 percent. The same result as the
+table above, reached without bucketing anything.
+
+July is the cheapest month at 1.54 c/kWh **despite having the year's lowest wind**, because demand
+is lowest too. Price is set by the ratio of demand to supply, not by either alone. That is the most
+precise statement this dataset supports.
+
 **Two apparent effects were confounders, and both were tested rather than assumed.** Consumption
 appeared to rise again above +20 C, and to rise with wind among mild hours. Controlling for hour
 of day removed the first; the second is explained by "mild" being a band wide enough to mix
 autumn storms with summer afternoons. Details in [PROGRESS.md](PROGRESS.md).
+
+**The daylight saving handling is verified by the data itself.** Hours per month, grouped by the
+local calendar: October 2025 has **745** and March 2026 has **743**, against 744 for a normal
+31-day month. The clock changes appear exactly where they should. This only works because
+`dim_date` is derived from local time; a UTC-derived date dimension would show 744 for both and
+the transitions would be invisible.
 
 ---
 
@@ -118,6 +146,19 @@ Capacity is SCD2 because it genuinely changes: 8,224 MW in 2025 and 9,330 MW in 
 from ENTSO-E. Overwriting the old value would silently recompute every 2025 capacity factor
 against a capacity that did not exist yet. The fact joins it **point in time**, on a range rather
 than on equality, so each hour uses the version in force at that moment.
+
+---
+
+## Dashboard
+
+An AI/BI dashboard reads the star schema directly: four headline figures and four charts covering
+price by weather conditions, consumption by temperature, the regional wind correlation, and monthly
+seasonality. Its definition lives in `dashboards/` and is version controlled with the rest of the
+project.
+
+Chart titles state the finding rather than the variables, and each carries a description covering
+what the reader cannot infer from the picture: how the wind bands are defined, which bar rests on a
+thin sample, and why one apparent anomaly is a confounder.
 
 ---
 
@@ -206,6 +247,10 @@ published.
 
 **Not scheduled.** A daily refresh cannot run entirely inside Databricks, because two of three
 sources are unreachable from it.
+
+**The dashboard cannot be shared publicly.** Free Edition offers only "people with access" or
+"anyone in my account", and the account has one user. The link was tested in a private window and
+shows a login wall, so the dashboard is included here as an image rather than a live link.
 
 **Prices are day-ahead spot** and exclude transmission, tax and margin.
 

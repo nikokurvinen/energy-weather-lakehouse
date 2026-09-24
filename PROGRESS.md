@@ -410,15 +410,77 @@ Finnish wind capacity from the data alone: concentrated on the west coast from V
 Nothing in the model was told where the turbines are. This validates the silver decision not to
 average the observation points.
 
-**Cold and calm together is the expensive case.** A cold calm hour averages 147.29 EUR/MWh, about
-14.7 cents per kWh; a mild windy hour averages 10.64, about 1.1 cents. Holding temperature at cold
-and varying only wind, the price falls 73 percent while consumption barely moves, which isolates
-the supply-side effect. Cold calm hours are 885, roughly 10 percent of the year, so this is a
+**Cold and calm together is the expensive case.** A cold calm hour averages 14.73 cents per kWh
+against 0.91 for a warm windy one, a sixteenfold difference. Holding temperature at cold and
+varying only wind, the price falls 73 percent while consumption barely moves, which isolates the
+supply-side effect. Cold calm hours are 885, roughly 10 percent of the year, so this is a
 recurring condition rather than a rare extreme.
+
+**The first version of this table used two temperature bands and hid a real effect.** "Mild" was
+everything above zero, which put a 5 C autumn evening and a 25 C summer afternoon in the same
+bucket despite prices differing almost twofold. Splitting warm out at 15 C produced a nine-cell
+table that is monotonic in both directions with no exceptions, and moved the headline figure from
+fourteenfold to sixteenfold.
+
+The threshold is 15 C rather than 20 C because only 175 hours in the whole series exceed 20 C, and
+split three ways by wind those cells would be too thin to report.
 
 **On averaging.** Summed per city there are 492 hours below -20 C; the national average produces
 47. Averaging four points discards roughly 90 percent of locally extreme cold, because one mild
 city cancels another's extreme.
+
+### Monthly seasonality, and a natural experiment
+
+Aggregating the power fact through `dim_date` gave a monthly series, and it contains a cleaner
+demonstration of the thesis than any of the bucketed tables.
+
+February 2026 and March 2026 had similar demand, 13,032 and 11,056 MW, and opposite wind, capacity
+factors of 0.19 and 0.42. Prices were 13.72 and 2.78 cents per kWh. Demand differs by 18 percent,
+wind by 118 percent, price by 393 percent. Two adjacent winter months, no bucketing, same result.
+
+July is the cheapest month at 1.54 cents **despite having the year's lowest capacity factor**,
+0.153, because demand is also at its floor. Price follows the ratio of demand to supply rather
+than either one alone, which is the most precise statement this dataset supports.
+
+**And the hour counts verified the timezone design.** Grouped by local calendar month, October 2025
+has 745 hours and March 2026 has 743, against 744 for a normal 31-day month. The daylight saving
+transitions land exactly where they should. This only works because `dim_date` is derived from
+local time; a UTC-derived date dimension would report 744 for both, because UTC has no daylight
+saving, and the transitions would be invisible.
+
+That was not designed as a test. It fell out of a routine `COUNT(*)` column added to sanity-check
+partial months, which is a reasonable argument for always carrying the row count.
+
+### Dashboard
+
+An AI/BI dashboard over the star schema: four counters and four charts. Built after the notebooks
+so the queries were already written and verified.
+
+Several things were wrong on the first pass and were caught by reading the output rather than by
+knowing the rules in advance:
+
+- **Stacked bars where grouped were meant.** Adding a colour split stacked cold and mild prices
+  into a single bar of 21.4 cents, a number nobody pays. Stacking is correct when the parts sum to
+  something meaningful; these are alternatives, not components.
+- **A title that claimed a trend the chart did not show.** "Consumption rises 70 percent in the
+  cold" sat above bars in alphabetical order, which looked random. The figure was right and the
+  axis order was wrong. A title that contradicts its own picture costs more credibility than no
+  title at all.
+- **Sort prefixes leaking into the display.** Labels read "1 Calm", "2 Moderate", which exposed a
+  SQL ordering workaround to the reader. Removed, with custom sort used where alphabetical order
+  does not match the natural one.
+- **Green and red as adjacent categories**, the most common accessibility failure. Replaced with a
+  diverging blue to grey to orange scale, which also encodes the ordering of temperature rather
+  than treating the bands as unrelated categories.
+- **A title promising interactivity the dashboard does not have.** "Hour by hour" with no filters.
+  The root cause is that the datasets aggregate in SQL, so the hour column no longer exists by the
+  time the dashboard sees the data. Pre-aggregating trades interactivity for simplicity, which is
+  a real design decision rather than an oversight, but the title should not have implied otherwise.
+
+**The dashboard cannot be shared publicly.** Free Edition offers only "people with access" or
+"anyone in my account", and the account has one user. Tested by opening the copied link in a
+private window: it shows a login wall. A third Free Edition limitation, alongside the network
+restriction and the absence of cluster configuration.
 
 ### A security incident, and what caused it
 
@@ -459,3 +521,24 @@ be deleted.
 - **Delete the two unused secret scopes.**
 - **PR-based merge workflow**, still doing direct `git merge`; revisit once CI exists so a pull
   request has something to gate on.
+
+### Dashboard, planned additions
+
+- **Hourly-grain datasets and filters.** The current datasets aggregate in SQL, which is why no
+  filter is possible. Feeding the dashboard hourly rows and letting it aggregate would make month,
+  season and hour-of-day filterable. With an hour-of-day filter the reader could watch the warm
+  weather anomaly disappear rather than reading about it in a caption.
+- **Heatmap, month by hour of day.** The daily rhythm is entirely absent from the current view and
+  `hour_of_day` is already in the fact table.
+- **Box plot per month**, replacing the mean line. Means hide the spread, and February's whiskers
+  carry more than its average does.
+- **Bubble scatter**, temperature against wind speed with price as colour. The thesis in one
+  picture, at hourly resolution, without bucketing. Needs transparency or binning at 8,624 points.
+- **Price histogram**, to show the skew: many cheap hours and a thin expensive tail.
+
+Considered and rejected: a **dual-axis chart** for a single crisis week. The idea is good but the
+form invents correlation, because the alignment of two y-scales is arbitrary. Small multiples
+sharing one x-axis carry the same information honestly. Also rejected: a **map** of the four
+observation points, whose proposed encoding needs per-area wind capacity that does not exist for
+this simplified four-point division, and a **gauge**, which Databricks does not support and which
+a counter does better anyway.
