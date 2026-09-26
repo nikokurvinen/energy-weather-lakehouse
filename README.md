@@ -4,7 +4,8 @@ How weather explains Finnish electricity consumption, wind production and price,
 resolution over a full year.
 
 A lakehouse built in Databricks Free Edition: three public APIs, a bronze/silver/gold pipeline on
-Delta Lake, quality checks as a gate, and a dimensional model with a slowly changing dimension.
+Delta Lake, quality checks as a gate, a dimensional model with a slowly changing dimension, and a
+scheduled refresh that spans two environments.
 
 ---
 
@@ -95,17 +96,24 @@ the transitions would be invisible.
 
 ## Architecture
 
+The pipeline runs across two environments, because one of them cannot reach two of the sources.
+
 ```
-Fingrid API  ─┐
-ENTSO-E API  ─┴─> local fetch ─> CSV ─> UC Volume ─┐
-                                                   ├─> BRONZE ─> SILVER ─> checks ─> GOLD
-Open-Meteo API ────────────> direct from notebook ─┘
+GitHub Actions, daily at 05:17 UTC
+  1. python -m ingest.run_local_fetch    Fingrid + ENTSO-E  ->  CSV
+  2. databricks fs cp                    CSV  ->  Unity Catalog volume
+  3. databricks jobs run-now             starts the job below
+
+Databricks Job, four tasks, each depending on the one before it
+  bronze  ->  silver  ->  quality checks  ->  gold
+     |
+     +--  Open-Meteo fetched directly here and merged incrementally
 ```
 
-### Two ingestion paths, for a documented reason
+### Why two environments
 
 Databricks Free Edition restricts outbound internet access to an undocumented set of allowed
-domains. All three source hosts were probed from the notebook:
+domains. All three source hosts were probed from a notebook:
 
 | Host | Result |
 | --- | --- |
@@ -113,12 +121,50 @@ domains. All three source hosts were probed from the notebook:
 | `data.fingrid.fi` | DNS resolution fails |
 | `web-api.tp.entsoe.eu` | DNS resolution fails |
 
-Weather is therefore fetched directly from the notebook. Fingrid and ENTSO-E are fetched by local
-scripts in `ingest/`, landed as CSV in a Unity Catalog volume, and read from there.
+Weather is therefore fetched inside the notebook, where it can be loaded incrementally. Fingrid
+and ENTSO-E are fetched by a GitHub Actions runner, landed as CSV in a Unity Catalog volume, and
+read from there.
 
 Separating ingestion from transformation is standard practice regardless of this constraint:
 production Spark clusters are frequently network isolated, with a dedicated ingestion layer
-landing data first.
+landing data first. Here the constraint forced the pattern rather than the other way round.
+
+### Orchestration
+
+The four notebooks run as a Databricks job with an explicit dependency chain, not as four things
+someone remembers to run in order. The chain is what makes the quality gate real: if
+`03_quality_checks` raises, `04_gold` is never started, and gold keeps its last good contents
+rather than being rebuilt on data that failed.
+
+**Retry policy follows the failure mode.** The bronze task retries with exponential backoff,
+because it calls a network API and a timeout or a 503 is transient. The quality gate has retries
+disabled entirely, because a failure there means the data is bad and the same run would fail
+identically. Retrying a deterministic failure only burns quota and blurs the signal.
+
+**The workflow order is fetch, upload, trigger.** If the fetch fails, nothing is uploaded and the
+job is never started, so the volume keeps yesterday's good files and the tables keep their last
+good state. Fail before corrupting, rather than half-writing and hoping.
+
+### Incremental loading
+
+Weather is loaded with a watermark and a Delta `MERGE`.
+
+The watermark is read from the target table rather than kept in a separate state file, because a
+value derived from the table is true by definition, including after a run that died halfway. The
+load window then runs from the watermark minus three days, so that values the source later revised
+are picked up, to today minus six days, because ERA5 is published daily with a five day delay and
+asking for yesterday returns nothing.
+
+`MERGE` matches on `(time, area_id)`, not on `time` alone: the same hour appears four times, once
+per observation point. A second run proves the mechanism, from the Delta history:
+
+| version | operation | source rows | updated | inserted |
+| --- | --- | --- | --- | --- |
+| 1 | MERGE | 384 | 384 | 0 |
+| 0 | CREATE TABLE AS SELECT | | | |
+
+384 rows rewritten in place, none appended, table size unchanged. A wrong merge key would show up
+here immediately as inserts.
 
 ### Layers
 
@@ -128,7 +174,7 @@ landing data first.
 alongside. Grain alignment, type repair, unit conversion, and incomplete hours dropped.
 
 **Quality checks** run between silver and gold as a gate. Nine checks defined as a view, and a
-cell that raises if any fail, so gold is never rebuilt on data that did not pass.
+cell that raises if any fail.
 
 **Gold** in two shapes: a wide `gold_hourly` table that feeds a dashboard with no joins, and a
 star schema for questions that need stated grain, conformed dimensions and history.
@@ -164,11 +210,11 @@ thin sample, and why one apparent anomaly is a confounder.
 
 ## Data sources
 
-| Source | Data | Format | Resolution |
-| --- | --- | --- | --- |
-| [Fingrid Open Data](https://data.fingrid.fi) | Consumption, wind production | JSON | 15 min |
-| [Open-Meteo](https://open-meteo.com) | Temperature, wind speed, 4 locations | JSON | hourly |
-| [ENTSO-E Transparency](https://transparency.entsoe.eu) | Day-ahead price, installed capacity | XML | 15/60 min, annual |
+| Source | Data | Format | Resolution | Loaded by |
+| --- | --- | --- | --- | --- |
+| [Fingrid Open Data](https://data.fingrid.fi) | Consumption, wind production | JSON | 15 min | GitHub Actions |
+| [Open-Meteo](https://open-meteo.com) | Temperature, wind speed, 4 locations | JSON | hourly | Databricks, incremental |
+| [ENTSO-E Transparency](https://transparency.entsoe.eu) | Day-ahead price, installed capacity | XML | 15/60 min, annual | GitHub Actions |
 
 Coverage: `2025-09-23` to `2026-09-17`, **8,624 hours**.
 
@@ -188,6 +234,12 @@ reconstructs the series.
 returns whole market days, so consecutive chunks overlapped by one day each. 12 chunks, 11
 boundaries, 1,056 duplicate rows, deduplicated on timestamp.
 
+**A table nothing could rebuild.** The bronze weather table had been created by a notebook version
+that no longer existed: every later cell read it, none wrote it. The pipeline ran green only
+because the table happened to persist between runs. Dropping it would have broken silver. This is
+the class of bug that survives orchestration precisely because state carries over, and the only
+honest test is to drop the target tables and run from empty.
+
 **A missing hour, traced end to end.** Gold held 8,624 rows where the window implies 8,625. The
 gap was traced back through silver to bronze and located at `2026-06-04 12:00` UTC, where Fingrid
 is missing one quarter-hour reading. The pipeline dropped the hour rather than averaging three
@@ -198,6 +250,13 @@ values. They are genuine: turbines draw power for control systems and heating wh
 near zero. The bound was corrected rather than the data clamped, because clamping would have
 looked tidier and falsified the energy balance.
 
+**A rate limit that backoff cannot fix.** Open-Meteo weights each request by the size of the date
+range, so a full year for four locations counts as hundreds of calls rather than four. The initial
+load hit the quota. Exponential backoff was added and is correct for a transient burst limit, but
+it retried five times and failed, because an hourly or daily quota does not clear in minutes.
+Backoff is the right tool for the wrong failure here; the actual fix is that the initial load
+happens once and every later run asks for three days.
+
 **A market structure change inside the data.** The European day-ahead market moved from hourly to
 quarter-hourly settlement in October 2025, inside the covered period, so the price series carries
 both resolutions. Handled with a single hourly mean, which is correct for either.
@@ -207,23 +266,34 @@ both resolutions. Handled with a single hourly mean, which is correct for either
 ## Stack
 
 Databricks Free Edition (serverless), Delta Lake, Unity Catalog, PySpark, Spark SQL, Python,
-Databricks Git folders, GitHub.
+Databricks Jobs, Databricks CLI, Databricks Git folders, GitHub, GitHub Actions.
 
 ## Layout
 
 ```
-ingest/       Python fetch scripts, one per source, plus a local orchestrator
-notebooks/    01_bronze, 02_silver, 03_quality_checks, 04_gold
-seeds/        Weather observation points
-src/, tests/  Transformation helpers and unit tests
+.github/workflows/  ci.yml (ruff + pytest), daily_refresh.yml (scheduled ingestion)
+ingest/             Python fetch scripts, one per source, plus the orchestrating entry point
+notebooks/          01_bronze, 02_silver, 03_quality_checks, 04_gold
+dashboards/         AI/BI dashboard definition
+seeds/              Weather observation points
+src/, tests/        Transformation helpers and unit tests
 ```
 
 ## Running it
 
+The pipeline runs itself daily. To run it by hand:
+
+**Scheduled path**: GitHub, Actions, Daily refresh, Run workflow. This fetches, uploads and
+triggers the Databricks job.
+
+**Locally**, to reproduce the ingestion side only:
+
 1. Copy `.env.example` to `.env` and add a Fingrid API key and an ENTSO-E token.
-2. `python -m ingest.run_local_fetch` writes CSVs to `data/bronze_raw/`.
+2. `python -m ingest.run_local_fetch` writes CSVs to `data/bronze_raw/`. `FETCH_DAYS=7` shortens
+   the window for a smoke test.
 3. Upload them to the Unity Catalog volume `energy_weather.landing`.
-4. Run the notebooks in order: `01_bronze`, `02_silver`, `03_quality_checks`, `04_gold`.
+4. Run the Databricks job, or the notebooks in order: `01_bronze`, `02_silver`,
+   `03_quality_checks`, `04_gold`.
 
 ---
 
@@ -239,14 +309,27 @@ one such variable was controlled for, which is reason to assume others are too.
 span the north/south temperature range and to put one observation near the west coast wind
 capacity. This is not an administrative or population-weighted division.
 
-**Full refresh, not incremental.** Every layer rebuilds with `mode("overwrite")`. This is fine at
-this volume but is not production practice. The intended design is a watermark plus a Delta
-`MERGE`, with a trailing re-merge window for the Fingrid series because measured data is revised
-as settlement completes, and none for the price, because an auction clearing price is final once
-published.
+**Only one of three sources is incremental.** Weather uses a watermark and a `MERGE`. Fingrid and
+the price are re-fetched in full for the trailing twelve months on every run and written with
+`mode("overwrite")`. That is correct at this volume and wasteful at any other. The pattern to
+extend is already in the repository; it has not been applied to the other two.
 
-**Not scheduled.** A daily refresh cannot run entirely inside Databricks, because two of three
-sources are unreachable from it.
+**A failed run is silent.** `databricks jobs run-now` returns as soon as the job starts, so the
+workflow reports success even if the job later fails. No notifications are configured on either
+side. In production this would be the first thing to fix: either wait for the run and propagate its
+status, or alert on failure.
+
+**The job definition is not in version control.** It exists only in the Databricks workspace, so it
+would not survive the workspace. The fix is a Databricks Asset Bundle checked into this repository.
+Related: the job points at a workspace path rather than a git ref, which means switching the Git
+folder's branch silently changes what the scheduled job runs.
+
+**The credentials expire.** The Databricks token used by the workflow is a personal access token
+with an expiry date, and it is tied to one person. A service principal with OAuth is the right
+mechanism; a personal token was used because it was available.
+
+**The schedule stops itself.** GitHub disables scheduled workflows after 60 days without repository
+activity, so the daily refresh will stop on its own if the project is left alone.
 
 **The dashboard cannot be shared publicly.** Free Edition offers only "people with access" or
 "anyone in my account", and the account has one user. The link was tested in a private window and

@@ -504,23 +504,190 @@ be deleted.
 
 ---
 
-## Open items going into Day 4
+## Day 4 (Sat 2026-09-26)
 
-- **Incremental loading.** Every layer currently does a full refresh with `mode("overwrite")`,
-  which works at 35,000 rows but is not how this is done in practice. The intended design is a
-  watermark plus a Delta `MERGE`, with a trailing re-merge window for the two Fingrid series
-  because measured data is revised as settlement completes. The day-ahead price does not need one:
-  an auction clearing price is a binding contract and is final once published. Different treatment
-  per source, decided by whether that source revises.
-- **`ci.yml`**, still not built. Planned: ruff and pytest on every push.
-- **Dashboard**, not started.
-- **Scheduling.** A daily refresh cannot run entirely inside Databricks, because two of three
-  sources are unreachable from it. The design is a scheduled GitHub Actions workflow that fetches,
-  uploads the CSVs to the Unity Catalog volume with the Databricks CLI, and triggers a Databricks
-  job to run the layers. Orchestration across two environments, caused by a network constraint.
-- **Delete the two unused secret scopes.**
-- **PR-based merge workflow**, still doing direct `git merge`; revisit once CI exists so a pull
-  request has something to gate on.
+Day 4 was meant to be Friday. It was not used, so this day carried orchestration, incremental
+loading and scheduling together, two days before the interview this project was built for.
+
+### Orchestration, moved up the list
+
+The plan had a Databricks job sitting at position seven. That ordering was wrong, and the argument
+that moved it was simple: without a job, **the quality gate was decoration**. `03_quality_checks`
+raised an exception, but nothing ran it automatically and its failure blocked nothing. Only inside
+a dependency chain does a failing gate stop `04_gold` from being rebuilt on bad data.
+
+Four tasks, `bronze -> silver -> quality_checks -> gold`, each depending on the previous one. A
+task whose upstream fails is reported as **Upstream failed** rather than failed, which matters when
+reading a run: it separates what broke from what merely waited.
+
+### Retry policy, and a default that lies
+
+The retry setting was made per task rather than accepted as a default, on one principle: **a retry
+only helps a transient failure.** `01_bronze` calls Open-Meteo over the network, so a timeout or a
+503 is worth retrying, with a delay rather than immediately, because an instant retry makes
+throttling worse. `02_silver`, `03_quality_checks` and `04_gold` touch no network; a failure there
+is deterministic and four attempts produce four identical failures while consuming four times the
+quota. Free Edition shuts the workspace down for the rest of the day when quota is exceeded, so
+this is not a theoretical concern.
+
+The quality gate in particular must not retry. A failure there means the data is bad; repeating the
+run blurs the signal it was built to produce.
+
+Setting "2 retries" on the bronze task produced a task showing **"at most 3x"**. The dialog itself
+explains why: "Enable serverless auto-optimization (may include at most 3 retries)" was checked,
+and its own text says that disabling all retries requires turning that off. A setting of zero is
+not zero until both are set. Worth reading configuration rather than filling it in.
+
+### A table nothing could rebuild
+
+Looking for the weather table's natural key surfaced something larger. Two bronze weather tables
+existed, `bronze_weather` and `bronze_weather_api`, identical in row count and range. `02_silver`
+read the first. Nothing in `01_bronze` wrote it: one cell read from it, another wrote to the second
+table, and the cell that had originally created it belonged to a version of the notebook that no
+longer existed.
+
+So the pipeline could not build itself from empty. The job had just passed, and passed only because
+the table persisted between runs. Dropping it would have broken silver immediately.
+
+This is the failure mode orchestration hides rather than reveals, because state carries over
+between runs. The only honest test is to drop the target tables and run from nothing, which is
+exactly what happened next, by necessity rather than by design.
+
+### Incremental weather load
+
+The fix and the next planned feature turned out to be the same work. The API path became the only
+weather path, because it is the only one Databricks can refresh by itself, and it was rewritten to
+load incrementally.
+
+**The watermark is read from the target table**, not from a state file, because a value derived
+from the table cannot disagree with the table, including after a run that died halfway. That is
+what makes the load idempotent.
+
+**The window starts three days behind the watermark**, so values the source revised after
+publication are re-fetched. Loading strictly forward from the watermark would mean an already
+loaded hour could never be corrected.
+
+**The window ends six days back**, because ERA5 publishes daily with a five day delay. The gap in
+the data was not a bug; it was the source's publication lag, and a pipeline that asks for yesterday
+gets an empty answer and looks broken.
+
+**And this is what forces `MERGE`.** With a fixed window, `mode("overwrite")` is correct, because
+every run produces the whole set. The moment the window moves, overwrite would delete the year and
+leave four days. Incremental loading and `MERGE` are not two tasks; they are one task in two parts.
+That connection had not been stated plainly before and should have been.
+
+The merge key is `(time, area_id)`. `time` alone matches four rows, one per observation point, and
+Delta refuses that with "multiple source rows matched the same target row" rather than guessing.
+The more dangerous error is the opposite: a key too specific matches nothing and inserts duplicates
+on every run, silently.
+
+Proof, from `DESCRIBE HISTORY`:
+
+| version | operation | source rows | updated | inserted | deleted |
+| --- | --- | --- | --- | --- | --- |
+| 1 | MERGE | 384 | 384 | 0 | 0 |
+| 0 | CREATE TABLE AS SELECT | | | | |
+
+384 rows rewritten in place, nothing appended, table unchanged at 35,424 rows.
+
+### A rate limit, and what backoff cannot do
+
+The initial load failed with HTTP 429. Open-Meteo weights requests by date range: two weeks counts
+as one call, four weeks as three. A year for four locations is hundreds of calls, not four.
+
+Exponential backoff was added to `fetch_weather`, waiting 10, 20, 40 and 80 seconds. It failed all
+five attempts. **Backoff is correct for a transient burst limit and useless against an hourly or
+daily quota**, which does not clear in minutes. The code was right and the diagnosis was wrong.
+
+The backoff stayed, because it is the right behaviour for the failure it addresses, and because
+every later run asks for three days rather than a year. The load succeeded two days later without
+any change, which is the plainest possible confirmation of what the limit actually was.
+
+Two defects in that first version, both visible in its own output. It printed "attempt 6/5",
+an off-by-one in the message. Worse, it slept 160 seconds on the final attempt and then gave up:
+the wait should only happen when another attempt follows. Ninety seconds of a rate-limited evening
+spent waiting for nothing.
+
+### A result that was not a result
+
+The second run of the load reported `Initial load written.` with an unchanged row count. Both
+numbers looked right, and the branch was wrong: that message only prints when the table does not
+exist, yet the previous cell had read a watermark from it. Two claims that could not both be true.
+
+`DESCRIBE HISTORY` settled it in one query: version 0 only, no `MERGE`. The cell had not been
+re-run and its previous output was still on screen. **A notebook shows the last output, not the
+current state**, which is exactly the trap a job avoids by keeping each run's output with that run.
+
+The habit worth keeping: when a printed result and a claimed state disagree, ask the store, not the
+screen.
+
+### Scheduling, across two environments
+
+Neither Fingrid nor ENTSO-E is reachable from Databricks, so a daily refresh cannot live inside it.
+The design that follows is a GitHub Actions workflow that fetches, uploads and triggers.
+
+Before writing any of it, two cheap tests settled whether it was possible at all: Free Edition does
+issue personal access tokens, and `databricks fs cp` writes to a Unity Catalog volume from outside
+the workspace. Five minutes of testing in place of an hour of speculation.
+
+`run_local_fetch.py` already fetched Fingrid on a rolling twelve-month window. Weather was removed
+from it, since the notebook now loads it directly, and the day-ahead price was added. The window
+became `FETCH_DAYS`, defaulting to 365, so a smoke test can run seven days without pulling a year
+through the APIs.
+
+Because the CSV always holds a full rolling year, `mode("overwrite")` in bronze remains correct for
+those two sources. They are not incremental, and saying so is more useful than pretending.
+
+The workflow does three things in a deliberate order: fetch, upload, trigger. A failed fetch
+uploads nothing and starts nothing, so the volume keeps yesterday's files and the tables keep their
+last good state.
+
+Three things about GitHub Actions scheduling that are easy to discover the hard way: scheduled runs
+queue and can be late by tens of minutes, which is why the cron is at minute 17 rather than on the
+hour; scheduled workflows are disabled after 60 days of repository inactivity; and `workflow_dispatch`
+only appears once the file is on the default branch, so "test it on a branch first" does not work
+and the advice given earlier here was wrong.
+
+First manual run: green in 3m23s, 35,039 and 35,038 Fingrid rows, 34,686 price rows from twelve
+chunks after deduplication. The job it triggered finished green in 2m20s, down from 3m55s, because
+the weather load had nothing left to fetch. Incremental loading visible in the wall clock.
+
+The secrets were checked rather than assumed: `securityToken` does not appear anywhere in the log,
+because a successful run prints only row counts. The URL carrying it reaches the log only on an
+error, which is how it leaked into a screenshot two days earlier.
+
+### A claim made without checking
+
+Early in the day this log's author asserted that the previous evening's work was not in version
+control, based on `git branch -a` in a local clone that had not fetched. The branch was on GitHub,
+pushed at 22:55 with CI green. Remote-tracking branches show the last fetch, not the remote. Fetch
+first, then claim.
+
+### Where this leaves the pipeline
+
+Running daily, end to end, with a quality gate that can stop it and one source loading
+incrementally. The gaps are known and listed below rather than hidden.
+
+---
+
+## Open items
+
+- **Extend `MERGE` to Fingrid and the price.** Both are re-fetched in full for twelve months and
+  written with `overwrite`. Correct at 35,000 rows, wrong in principle. The pattern exists in
+  `01_bronze` for weather; applying it needs a trailing re-merge window for the two Fingrid series,
+  because measured data is revised as settlement completes, and none for the price, because an
+  auction clearing price is final once published.
+- **Notify on failure.** `databricks jobs run-now` returns immediately, so the workflow is green
+  regardless of what the job does afterwards. Either poll the run and propagate its status, or
+  configure job notifications. Currently a failed nightly run would go unnoticed.
+- **Put the job in version control** as a Databricks Asset Bundle. It exists only in the workspace
+  UI. Related: the job points at a workspace path, not a git ref, so switching the Git folder's
+  branch changes what the scheduled job runs without touching the job.
+- **Replace the personal access token with a service principal.** The current token expires
+  2026-10-07 and is tied to one person, so the pipeline stops on that date.
+- **Delete the two unused secret scopes** `fingrid` and `entsoe`, the unused `weather.csv` in the
+  volume, and the stale feature branches.
+- **PR-based merge workflow**, still doing direct `git merge` even though CI now exists to gate on.
 
 ### Dashboard, planned additions
 
