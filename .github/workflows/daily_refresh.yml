@@ -32,6 +32,12 @@ jobs:
         env:
           FINGRID_API_KEY: ${{ secrets.FINGRID_API_KEY }}
           ENTSOE_API_TOKEN: ${{ secrets.ENTSOE_API_TOKEN }}
+          # A daily run only needs a trailing window: bronze merges on the natural
+          # key, so re-fetching a full year would change nothing and cost everything.
+          # Fourteen days covers Finnish balance settlement, which is when measured
+          # data still gets revised. A backfill runs the same script by hand with
+          # FETCH_DAYS=365.
+          FETCH_DAYS: "14"
         run: python -m ingest.run_local_fetch
 
       - uses: databricks/setup-cli@main
