@@ -26,6 +26,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
+      # Fetch first, upload second, trigger third. A failed fetch uploads nothing
+      # and starts nothing, so the volume keeps yesterday's good files.
       - name: Fetch source data
         env:
           FINGRID_API_KEY: ${{ secrets.FINGRID_API_KEY }}
@@ -49,14 +51,23 @@ jobs:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: |
-          # run-now waits for the run to finish by default and prints its final state.
-          # The explicit check does not rely on the exit code, and it also catches
-          # SUCCESS_WITH_FAILURES, where individual tasks failed but the run as a
-          # whole is not reported as a failure.
-          result=$(databricks jobs run-now 492779937214840 --timeout 30m \
-            | tee /dev/stderr \
-            | jq -r '.state.result_state')
+          # run-now waits for the run to reach a terminal state by default. On
+          # failure it exits non-zero and prints an error rather than the run
+          # JSON, so capture both streams and give every failure mode a name.
+          # An empty result_state would still fail the check below, but it would
+          # not say why, which is the difference between an alert and a riddle.
+          if output=$(databricks jobs run-now 492779937214840 --timeout 30m 2>&1); then
+            result=$(echo "$output" | jq -r '.state.result_state // "NO_STATE_IN_RESPONSE"')
+          else
+            result="CLI_ERROR"
+          fi
+
+          echo "$output"
           echo "Databricks run finished with result_state=$result"
+
+          # Checking the state rather than the exit code also catches
+          # SUCCESS_WITH_FAILURES, where individual tasks failed but the run as
+          # a whole is not reported as a failure.
           if [ "$result" != "SUCCESS" ]; then
             echo "::error::Databricks job did not succeed: $result"
             exit 1
