@@ -1,11 +1,12 @@
 # energy-weather-lakehouse
 
-How weather explains Finnish electricity consumption, wind production and price, at hourly
-resolution over a full year.
+In Finland, an hour that is cold and calm costs sixteen times as much electricity as an hour that
+is warm and windy. This measures that, hour by hour across a year, from three public APIs.
 
-A lakehouse built in Databricks Free Edition: three public APIs, a bronze/silver/gold pipeline on
-Delta Lake, quality checks as a gate, a dimensional model with a slowly changing dimension, and a
-scheduled refresh that spans two environments.
+A lakehouse in Databricks Free Edition: bronze, silver and gold on Delta Lake, incremental loads
+that merge rather than overwrite, quality checks that can stop the pipeline before it reaches the
+reporting layer, a star schema with a slowly changing dimension, and a daily refresh that runs
+across two environments because one of them cannot reach two of the sources.
 
 ---
 
