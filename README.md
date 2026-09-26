@@ -314,10 +314,12 @@ the price are re-fetched in full for the trailing twelve months on every run and
 `mode("overwrite")`. That is correct at this volume and wasteful at any other. The pattern to
 extend is already in the repository; it has not been applied to the other two.
 
-**A failed run is silent.** `databricks jobs run-now` returns as soon as the job starts, so the
-workflow reports success even if the job later fails. No notifications are configured on either
-side. In production this would be the first thing to fix: either wait for the run and propagate its
-status, or alert on failure.
+**Failure reaches one place, not everyone who should know.** The workflow waits for the
+Databricks run, reads its `result_state` and fails explicitly on anything other than `SUCCESS`,
+rather than trusting an exit code, which also covers `SUCCESS_WITH_FAILURES`. The job itself emails
+on failure. That is enough for one person; a team would route this to a channel with an on-call
+owner, and would alert on data freshness rather than only on the run, because a pipeline that
+succeeds every night while its source stops publishing is the failure nobody sees.
 
 **The job definition is not in version control.** It exists only in the Databricks workspace, so it
 would not survive the workspace. The fix is a Databricks Asset Bundle checked into this repository.

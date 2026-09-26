@@ -48,4 +48,16 @@ jobs:
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-        run: databricks jobs run-now 492779937214840
+        run: |
+          # run-now waits for the run to finish by default and prints its final state.
+          # The explicit check does not rely on the exit code, and it also catches
+          # SUCCESS_WITH_FAILURES, where individual tasks failed but the run as a
+          # whole is not reported as a failure.
+          result=$(databricks jobs run-now 492779937214840 --timeout 30m \
+            | tee /dev/stderr \
+            | jq -r '.state.result_state')
+          echo "Databricks run finished with result_state=$result"
+          if [ "$result" != "SUCCESS" ]; then
+            echo "::error::Databricks job did not succeed: $result"
+            exit 1
+          fi
