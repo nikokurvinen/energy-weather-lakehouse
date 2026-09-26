@@ -1,0 +1,51 @@
+name: Daily refresh
+
+on:
+  schedule:
+    # 05:17 UTC, a few minutes off the hour because runners queue heavily at :00.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+# A second run must not overwrite the Volume while the first is still uploading.
+concurrency:
+  group: daily-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Fetch source data
+        env:
+          FINGRID_API_KEY: ${{ secrets.FINGRID_API_KEY }}
+          ENTSOE_API_TOKEN: ${{ secrets.ENTSOE_API_TOKEN }}
+        run: python -m ingest.run_local_fetch
+
+      - uses: databricks/setup-cli@main
+
+      - name: Upload CSVs to the Unity Catalog volume
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          for file in fingrid_consumption fingrid_wind entsoe_price; do
+            databricks fs cp "data/bronze_raw/${file}.csv" \
+              "dbfs:/Volumes/workspace/energy_weather/landing/${file}.csv" --overwrite
+          done
+
+      - name: Trigger the Databricks job
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: databricks jobs run-now 492779937214840
