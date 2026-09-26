@@ -1,0 +1,74 @@
+# Databricks Asset Bundle: the job definition as code.
+#
+# The notebooks stay in the Git folder rather than being deployed by the bundle,
+# because they import ingest/ from the repository and that only resolves when the
+# repository layout is intact in the workspace. The bundle owns orchestration;
+# the Git folder owns the code.
+#
+# Deploy from a laptop, not from inside the workspace: bundle deploy downloads a
+# Terraform binary from HashiCorp, which Free Edition's outbound allowlist blocks.
+#
+# The workspace host is deliberately absent. The CLI reads it from ~/.databrickscfg,
+# so the address of a private workspace stays out of a public repository.
+bundle:
+  name: energy-weather-lakehouse
+
+variables:
+  notebook_root:
+    description: Workspace path of the Git folder holding the notebooks.
+    default: /Workspace/Users/dev@nikokurvinen.fi/energy-weather-lakehouse/notebooks
+  alert_email:
+    description: Address that receives a message when a run fails.
+    default: dev@nikokurvinen.fi
+
+targets:
+  prod:
+    mode: production
+    default: true
+    run_as:
+      user_name: dev@nikokurvinen.fi
+    workspace:
+      # Stated rather than left to the CLI's default. The default already resolves
+      # to this path, but it is a default: if a later CLI version changes it, the
+      # next deploy would create a second copy instead of updating this one.
+      root_path: /Workspace/Users/dev@nikokurvinen.fi/.bundle/${bundle.name}/${bundle.target}
+
+resources:
+  jobs:
+    daily_refresh:
+      name: energy_weather_daily_refresh
+
+      email_notifications:
+        on_failure:
+          - ${var.alert_email}
+
+      tasks:
+        # Bronze is the only task that calls a network API, so it is the only one
+        # that retries: a timeout or a 503 is transient. The delay avoids making
+        # throttling worse by retrying instantly.
+        - task_key: bronze
+          notebook_task:
+            notebook_path: ${var.notebook_root}/01_bronze
+          max_retries: 2
+          min_retry_interval_millis: 300000
+
+        - task_key: silver
+          depends_on:
+            - task_key: bronze
+          notebook_task:
+            notebook_path: ${var.notebook_root}/02_silver
+
+        # No retries on the gate. A failure here means the data is bad, so the same
+        # run would fail identically; repeating it only blurs the signal.
+        - task_key: quality_checks
+          depends_on:
+            - task_key: silver
+          notebook_task:
+            notebook_path: ${var.notebook_root}/03_quality_checks
+          max_retries: 0
+
+        - task_key: gold
+          depends_on:
+            - task_key: quality_checks
+          notebook_task:
+            notebook_path: ${var.notebook_root}/04_gold
