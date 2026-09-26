@@ -62,7 +62,7 @@ jobs:
           # JSON, so capture both streams and give every failure mode a name.
           # An empty result_state would still fail the check below, but it would
           # not say why, which is the difference between an alert and a riddle.
-          if output=$(databricks jobs run-now 492779937214840 --timeout 30m 2>&1); then
+          if output=$(databricks jobs run-now 340665342308648 --timeout 30m 2>&1); then
             result=$(echo "$output" | jq -r '.state.result_state // "NO_STATE_IN_RESPONSE"')
           else
             result="CLI_ERROR"
