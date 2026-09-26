@@ -136,10 +136,16 @@ someone remembers to run in order. The chain is what makes the quality gate real
 `03_quality_checks` raises, `04_gold` is never started, and gold keeps its last good contents
 rather than being rebuilt on data that failed.
 
-**Retry policy follows the failure mode.** The bronze task retries with exponential backoff,
-because it calls a network API and a timeout or a 503 is transient. The quality gate has retries
+**Retry policy follows the failure mode.** The bronze task retries twice with a five minute gap,
+because it calls a network API where a timeout or a 503 is transient. The quality gate has retries
 disabled entirely, because a failure there means the data is bad and the same run would fail
-identically. Retrying a deterministic failure only burns quota and blurs the signal.
+identically; retrying a deterministic failure only burns quota and blurs the signal. Inside the
+fetch itself the backoff is exponential, 10 to 80 seconds, because that layer is talking to a
+service that throttles and an instant retry makes throttling worse.
+
+Setting the gate to zero retries takes two changes, not one. Databricks serverless offers an
+auto-optimization option that "may include at most 3 retries", so a task configured with zero still
+retries until that is also turned off. The run log showed "at most 3x" next to a setting of two.
 
 **The workflow order is fetch, upload, trigger.** If the fetch fails, nothing is uploaded and the
 job is never started, so the volume keeps yesterday's good files and the tables keep their last
@@ -196,7 +202,9 @@ since the previous run.
 
 ### Layers
 
-**Bronze** accepts data as each source delivers it. Four tables, no transformation.
+**Bronze** accepts each source's values as delivered, with no cleaning, conversion or reshaping.
+It does own how rows arrive: a declared schema rather than an inferred one, and a `MERGE` on the
+natural key rather than an overwrite.
 
 **Silver** conforms everything to one row per hour on a UTC key, with Finnish local time derived
 alongside. Grain alignment, type repair, unit conversion, and incomplete hours dropped.
@@ -204,8 +212,29 @@ alongside. Grain alignment, type repair, unit conversion, and incomplete hours d
 **Quality checks** run between silver and gold as a gate. Nine checks defined as a view, and a
 cell that raises if any fail.
 
+The gate has been proven by deliberately breaking it. With one bound tightened, the check failed,
+`04_gold` was reported as **skipped** rather than failed, the task ran once rather than retrying,
+the workflow went red, and the job emailed the failing task name. Rows written fell from 218,431 to
+166,848: the difference is gold, which was never built. A gate that has never stopped anything is a
+claim, not a control.
+
 **Gold** in two shapes: a wide `gold_hourly` table that feeds a dashboard with no joins, and a
 star schema for questions that need stated grain, conformed dimensions and history.
+
+### Tests and CI
+
+`ruff` and `pytest` run on every push and on every pull request. The tests are pure Python with no
+Spark, so the suite finishes in under twenty seconds, which is what makes it something you actually
+wait for rather than skip.
+
+What is tested is the parsing logic, because that is where a silent wrong answer is possible.
+ENTSO-E omits unchanged price points, so a response can contain positions 1, 2 and 4 with 3 missing;
+the tests assert that the row count follows the declared period rather than the number of points,
+that a missing position repeats the previous price, that timestamps step by the declared resolution,
+and that overlapping chunks deduplicate to the first occurrence.
+
+CI was verified the only way it can be: by deliberately breaking an assertion, watching the pipeline
+go red, and restoring it. Both commits are in the history.
 
 ### Dimensional model
 
@@ -244,7 +273,10 @@ thin sample, and why one apparent anomaly is a confounder.
 | [Open-Meteo](https://open-meteo.com) | Temperature, wind speed, 4 locations | JSON | hourly | Databricks, incremental |
 | [ENTSO-E Transparency](https://transparency.entsoe.eu) | Day-ahead price, installed capacity | XML | 15/60 min, annual | GitHub Actions |
 
-Coverage: `2025-09-23` to `2026-09-17`, **8,624 hours**.
+Coverage grows with every run. The start is fixed at the first backfill; the end is set by the
+**shortest** source, because gold inner joins the four together. That is weather: ERA5 publishes
+daily with a five day delay, so `gold_hourly` always ends about six days behind today. At the time
+the findings above were computed it held 8,624 hours.
 
 Three source formats, three different time resolutions, and two different ways of expressing time:
 Fingrid and Open-Meteo carry timestamps on the row, while ENTSO-E carries a position index that has
@@ -374,7 +406,8 @@ activity, so the daily refresh will stop on its own if the project is left alone
 
 **The dashboard cannot be shared publicly.** Free Edition offers only "people with access" or
 "anyone in my account", and the account has one user. The link was tested in a private window and
-shows a login wall, so the dashboard is included here as an image rather than a live link.
+shows a login wall, so there is no live link to give. Its definition is version controlled in
+`dashboards/`, which is the reproducible form; a screenshot is not a substitute for that.
 
 **Prices are day-ahead spot** and exclude transmission, tax and margin.
 
