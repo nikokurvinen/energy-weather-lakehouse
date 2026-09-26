@@ -663,31 +663,106 @@ control, based on `git branch -a` in a local clone that had not fetched. The bra
 pushed at 22:55 with CI green. Remote-tracking branches show the last fetch, not the remote. Fetch
 first, then claim.
 
+### Testing the alert by breaking the gate
+
+An alert that has never fired is not an alert. The wind lower bound in the quality view was
+changed from -500 to 0, which reproduces a real failure rather than an artificial one: that was
+the bound the check originally had, and it was the check that was wrong, not the data.
+
+The run did four things at once, and all four were the point. `quality_checks` failed. `gold` was
+**skipped**, not failed, so the gate demonstrably stops the chain. The task ran **once**, which
+confirms that both the retry count and the serverless auto-optimization override are off. The
+workflow went red, and the job emailed the failing task name with a note that downstream tasks were
+skipped. `Rows written` fell from 218,431 to 166,848: the difference is gold, which was never
+built.
+
+The guard in the workflow fired correctly and reported nothing useful: the message read
+`Databricks job did not succeed:` with an empty state. On failure the CLI exits non-zero and prints
+an error instead of the run JSON, so `jq` received nothing, and the pipeline swallowed the exit
+code because bash returns the status of the last command in a pipe. Failing closed on an empty
+string is the right direction, but an alert that says only "something broke" sends you to the UI.
+Capturing both streams separately gives every failure mode a name: `FAILED`, `CLI_ERROR`,
+`NO_STATE_IN_RESPONSE`.
+
+An earlier note in this log claimed `databricks jobs run-now` was fire and forget. It is not: it
+waits for a terminal state by default, with a twenty minute timeout, and `--no-wait` opts out. That
+claim had already been written into the README as a limitation before it was checked.
+
+### Merge for the other three sources
+
+Bronze read three CSVs and wrote each with `mode("overwrite")`. Correct only while the fetch
+covers the whole period; with a trailing window it would delete the year.
+
+Each source now merges on its natural key: `startTime` for the two Fingrid series, `time` for the
+price. Schemas are declared rather than inferred, because inference reads the file twice and can
+type a column differently on a day when it happens to be entirely null. Three near-identical blocks
+became one function over a list of `(table, file, schema, keys)`, so a fourth source is one line.
+
+Then the window shrank: `FETCH_DAYS: "14"` in the workflow, because merging on the key makes a full
+year produce an identical table at twelve times the API cost.
+
+The end-to-end number is the one worth keeping: **1,343 rows fetched, two rows added.** The other
+1,341 were rewritten in place, and two is exactly how many quarter-hour readings Fingrid had
+published in the half hour since the previous run.
+
+### The job as code
+
+The job existed only in the workspace UI. `databricks.yml` now declares it, and
+`databricks bundle deploy` makes the workspace match the file.
+
+The same network restriction appeared a third time, and this time it was checked before building
+anything: bundles deploy fine from a laptop but fail inside the workspace, because `bundle deploy`
+downloads a Terraform binary from HashiCorp. Two cheap tests settled feasibility before an hour was
+spent on it, which is the same discipline that was missing on day three when a secret scope was
+created for an API that turned out to be unreachable.
+
+`bundle validate` recommended stating `workspace.root_path` explicitly, even though its default
+already resolved to exactly that path. The reason is good: a default that changes in a later CLI
+version would deploy a second copy instead of updating the first.
+
+The migration kept something working at every step. The bundle created a job under a different
+name, that job was run and proved green, the hand-made job was deleted, the bundle job was renamed,
+and only then did the workflow point at it. The job ID survives a rename because the bundle tracks
+the resource by its key, not its name.
+
+The bundle owns orchestration only. The notebooks stay in the Git folder, because they import
+`ingest/` from the repository and that resolves only when the repository layout is intact. So the
+job definition is now version controlled while the code it runs is still whichever branch the Git
+folder happens to be on. That is a smaller gap than before, but it is a gap, and it is listed
+below rather than described as finished.
+
 ### Where this leaves the pipeline
 
-Running daily, end to end, with a quality gate that can stop it and one source loading
-incrementally. The gaps are known and listed below rather than hidden.
+Running daily, end to end. Fetch, upload and trigger in an order that fails before it corrupts. A
+quality gate that has been shown to stop the chain, with an alert that has been shown to arrive.
+Every bronze table merging on a natural key. The job definition in version control. The gaps are
+known and listed below rather than hidden.
+
+One thing did not get done, and it was the more important one for the interview this project was
+built for: no time went to SQL practice or to rehearsing the project out loud. The tooling was more
+fun than the preparation, which is exactly the trap this kind of project sets.
 
 ---
 
 ## Open items
 
-- **Extend `MERGE` to Fingrid and the price.** Both are re-fetched in full for twelve months and
-  written with `overwrite`. Correct at 35,000 rows, wrong in principle. The pattern exists in
-  `01_bronze` for weather; applying it needs a trailing re-merge window for the two Fingrid series,
-  because measured data is revised as settlement completes, and none for the price, because an
-  auction clearing price is final once published.
-- **Notify on failure.** `databricks jobs run-now` returns immediately, so the workflow is green
-  regardless of what the job does afterwards. Either poll the run and propagate its status, or
-  configure job notifications. Currently a failed nightly run would go unnoticed.
-- **Put the job in version control** as a Databricks Asset Bundle. It exists only in the workspace
-  UI. Related: the job points at a workspace path, not a git ref, so switching the Git folder's
-  branch changes what the scheduled job runs without touching the job.
+- **Watermark Fingrid and the price** instead of a fixed fourteen day window. Every source merges
+  now, but only weather derives its window from the target table. Fourteen days is a guess at how
+  long settlement keeps revising; a missed run longer than that would leave a gap nobody notices.
+- **Run the notebooks from a git ref.** The bundle owns the job definition, but the job reads
+  notebooks from a workspace path, so switching the Git folder's branch changes what the scheduled
+  job runs. Either point the job at a git ref or run the copy the bundle deploys; both have to keep
+  the repository layout intact, because the notebooks import `ingest/`.
+- **Stop hard coding the job ID** in the workflow. If the bundle ever recreates the job instead of
+  updating it, the ID changes and the trigger points at nothing. `databricks bundle summary` can
+  supply it at run time.
 - **Replace the personal access token with a service principal.** The current token expires
-  2026-10-07 and is tied to one person, so the pipeline stops on that date.
-- **Delete the two unused secret scopes** `fingrid` and `entsoe`, the unused `weather.csv` in the
-  volume, and the stale feature branches.
-- **PR-based merge workflow**, still doing direct `git merge` even though CI now exists to gate on.
+  2026-10-07 and belongs to one person, so the pipeline stops on that date.
+- **Alert on freshness, not only on runs.** A pipeline that succeeds every night while its source
+  quietly stops publishing is the failure nobody sees. The quality view is the natural place for a
+  maximum-age check.
+- **The GitHub schedule disables itself** after 60 days without repository activity. Not fixable,
+  only known.
 
 ### Dashboard, planned additions
 

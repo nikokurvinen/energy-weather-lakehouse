@@ -145,26 +145,54 @@ identically. Retrying a deterministic failure only burns quota and blurs the sig
 job is never started, so the volume keeps yesterday's good files and the tables keep their last
 good state. Fail before corrupting, rather than half-writing and hoping.
 
+**The job is defined as code.** `databricks.yml` declares the task chain, the dependency order, the
+per-task retry policy and the failure notification, and `databricks bundle deploy` makes the
+workspace match the file. A job that exists only in a UI cannot be reviewed, diffed or rebuilt, and
+a change to it leaves no trace; this one is a pull request like any other. The bundle is deployed
+from a laptop rather than from inside the workspace, because `bundle deploy` downloads a Terraform
+binary from HashiCorp, which the same outbound allowlist blocks.
+
 ### Incremental loading
 
-Weather is loaded with a watermark and a Delta `MERGE`.
+Every bronze table is written with a Delta `MERGE` on the source's natural key, never with
+`mode("overwrite")`. Overwrite is correct only when each run produces the whole dataset; the moment
+the fetch window moves, it deletes the year and leaves the window.
 
-The watermark is read from the target table rather than kept in a separate state file, because a
-value derived from the table is true by definition, including after a run that died halfway. The
-load window then runs from the watermark minus three days, so that values the source later revised
-are picked up, to today minus six days, because ERA5 is published daily with a five day delay and
-asking for yesterday returns nothing.
+| Table | Merge key | Why that key |
+| --- | --- | --- |
+| `bronze_consumption` | `startTime` | one row per quarter hour |
+| `bronze_wind` | `startTime` | one row per quarter hour |
+| `bronze_price` | `time` | one row per settlement interval |
+| `bronze_weather` | `time, area_id` | the same hour appears once per observation point |
 
-`MERGE` matches on `(time, area_id)`, not on `time` alone: the same hour appears four times, once
-per observation point. A second run proves the mechanism, from the Delta history:
+A key that is too broad matches several target rows and Delta refuses the merge outright. A key
+that is too narrow matches nothing and inserts duplicates on every run, silently, which is the
+worse failure.
+
+**Weather carries a watermark.** It is read from the target table rather than kept in a separate
+state file, because a value derived from the table is true by definition, including after a run
+that died halfway. The window runs from the watermark minus three days, so values the source later
+revised are picked up, to today minus six days, because ERA5 is published daily with a five day
+delay and asking for yesterday returns nothing.
+
+**Fingrid and the price use a fixed trailing window** of fourteen days, set by `FETCH_DAYS` in the
+workflow. Fourteen days covers the period in which Finnish balance settlement still revises
+measured data. A backfill runs the same script with `FETCH_DAYS=365`.
+
+There is no `WHEN NOT MATCHED BY SOURCE THEN DELETE`. A row the source stops delivering is kept,
+which is correct for an append-mostly time series and would be wrong for a snapshot of current
+state.
+
+The Delta history is the proof, and it also records the change of strategy:
 
 | version | operation | source rows | updated | inserted |
 | --- | --- | --- | --- | --- |
-| 1 | MERGE | 384 | 384 | 0 |
-| 0 | CREATE TABLE AS SELECT | | | |
+| 8 | MERGE | 35,039 | 35,039 | 0 |
+| 7 | CREATE OR REPLACE TABLE AS SELECT | | | |
 
-384 rows rewritten in place, none appended, table size unchanged. A wrong merge key would show up
-here immediately as inserts.
+And end to end, on a fourteen day window: **1,343 rows fetched, two rows added.** The other 1,341
+were rewritten in place. Two is exactly the number of quarter-hour readings Fingrid had published
+since the previous run.
 
 ### Layers
 
@@ -266,11 +294,13 @@ both resolutions. Handled with a single hourly mean, which is correct for either
 ## Stack
 
 Databricks Free Edition (serverless), Delta Lake, Unity Catalog, PySpark, Spark SQL, Python,
-Databricks Jobs, Databricks CLI, Databricks Git folders, GitHub, GitHub Actions.
+Databricks Jobs, Databricks Asset Bundles, Databricks CLI, Databricks Git folders, GitHub,
+GitHub Actions.
 
 ## Layout
 
 ```
+databricks.yml      The job definition as code, deployed with the Databricks CLI
 .github/workflows/  ci.yml (ruff + pytest), daily_refresh.yml (scheduled ingestion)
 ingest/             Python fetch scripts, one per source, plus the orchestrating entry point
 notebooks/          01_bronze, 02_silver, 03_quality_checks, 04_gold
@@ -295,6 +325,9 @@ triggers the Databricks job.
 4. Run the Databricks job, or the notebooks in order: `01_bronze`, `02_silver`,
    `03_quality_checks`, `04_gold`.
 
+**To change the job**, edit `databricks.yml` and run `databricks bundle validate` and
+`databricks bundle deploy`. Do not edit it in the workspace UI: the next deploy would revert it.
+
 ---
 
 ## Honest limitations
@@ -309,10 +342,11 @@ one such variable was controlled for, which is reason to assume others are too.
 span the north/south temperature range and to put one observation near the west coast wind
 capacity. This is not an administrative or population-weighted division.
 
-**Only one of three sources is incremental.** Weather uses a watermark and a `MERGE`. Fingrid and
-the price are re-fetched in full for the trailing twelve months on every run and written with
-`mode("overwrite")`. That is correct at this volume and wasteful at any other. The pattern to
-extend is already in the repository; it has not been applied to the other two.
+**Only weather is watermarked.** Every source merges, but Fingrid and the price use a fixed
+fourteen day window rather than a watermark derived from the target table. Fourteen days is a
+guess at how long settlement keeps revising, checked against nothing. If a run were missed for
+longer than that, the gap would not be noticed or filled; a watermark would make the window
+self-correcting.
 
 **Failure reaches one place, not everyone who should know.** The workflow waits for the
 Databricks run, reads its `result_state` and fails explicitly on anything other than `SUCCESS`,
@@ -321,10 +355,15 @@ on failure. That is enough for one person; a team would route this to a channel 
 owner, and would alert on data freshness rather than only on the run, because a pipeline that
 succeeds every night while its source stops publishing is the failure nobody sees.
 
-**The job definition is not in version control.** It exists only in the Databricks workspace, so it
-would not survive the workspace. The fix is a Databricks Asset Bundle checked into this repository.
-Related: the job points at a workspace path rather than a git ref, which means switching the Git
-folder's branch silently changes what the scheduled job runs.
+**The job runs whatever the Git folder is checked out to.** The bundle owns the job definition,
+but the notebooks it runs are read from a workspace path, not from a git ref, so switching the Git
+folder's branch silently changes what the scheduled job executes. Pointing the job at a git ref, or
+running the notebooks the bundle itself deploys, would close this. The notebooks import `ingest/`
+from the repository, so whichever path is used has to keep the repository layout intact.
+
+**The job ID is hard coded in the workflow.** If the bundle ever recreates the job rather than
+updating it, the ID changes and the workflow triggers nothing. Reading the ID at run time from
+`databricks bundle summary` would remove the coupling, at the cost of another moving part.
 
 **The credentials expire.** The Databricks token used by the workflow is a personal access token
 with an expiry date, and it is tied to one person. A service principal with OAuth is the right
